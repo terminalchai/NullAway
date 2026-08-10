@@ -116,6 +116,13 @@ public final class GenericsChecks {
   /** Maps each {@code var}-declared local to its declaration tree */
   private final Map<Symbol, VariableTree> varLocalDeclarations = new LinkedHashMap<>();
 
+  /**
+   * Tracks generic method invocations currently undergoing nested-nullability repair so re-entrant
+   * requests for the same invocation can use the already inferred call-site method type rather than
+   * recursing back through the same repair logic.
+   */
+  private final Set<MethodInvocationTree> nestedNullabilityRepairInProgress = new LinkedHashSet<>();
+
   public @Nullable Type getInferredPolyExpressionType(Tree tree) {
     Preconditions.checkArgument(
         tree instanceof LambdaExpressionTree || tree instanceof MemberReferenceTree,
@@ -846,9 +853,10 @@ public final class GenericsChecks {
             // call.  We invoke getEnclosingTypeForCallExpression, which will run
             // inference if needed, and then recompute the type as a member of the returned
             // enclosing type
+            Symbol.MethodSymbol symbol = castToNonNull(ASTHelpers.getSymbol(invocationTree));
             Type.MethodType methodType =
-                getInferenceExecutableType(
-                    invocationTree, state.getPath(), state, calledFromDataflow);
+                getInvokedMethodTypeAtCall(
+                    symbol, invocationTree, state.getPath(), state, calledFromDataflow);
             // restore explicit annotations from the return type
             Type returnType = methodType.getReturnType();
             result =
@@ -2608,9 +2616,25 @@ public final class GenericsChecks {
       Type.MethodType methodTypeAtCallSite =
           castToNonNull(ASTHelpers.getType(invocationTree.getMethodSelect())).asMethodType();
       if (result instanceof InferenceSuccess successResult) {
-        methodTypeAtCallSite =
-            restoreNestedNullabilityForTypeVarArguments(
-                invocationTree, methodType, methodTypeAtCallSite, path, state, calledFromDataflow);
+        // Repairing dropped nested nullability annotations can itself inspect actual argument
+        // types. For diamond constructor arguments, that can re-enter method-type computation for
+        // this same invocation while we are still repairing it. In that case, use the already
+        // inferred method type and skip the repair on the recursive call.
+        if (!nestedNullabilityRepairInProgress.contains(invocationTree)) {
+          nestedNullabilityRepairInProgress.add(invocationTree);
+          try {
+            methodTypeAtCallSite =
+                restoreNestedNullabilityForTypeVarArguments(
+                    invocationTree,
+                    methodType,
+                    methodTypeAtCallSite,
+                    path,
+                    state,
+                    calledFromDataflow);
+          } finally {
+            nestedNullabilityRepairInProgress.remove(invocationTree);
+          }
+        }
         return TypeSubstitutionUtils.updateMethodTypeWithInferredNullability(
             methodTypeAtCallSite, methodType, successResult.typeVarNullability, state, config);
       } else {
@@ -2689,27 +2713,25 @@ public final class GenericsChecks {
   private CallAndContext getCallAndContextForInference(
       TreePath path, VisitorState state, boolean calledFromDataflow) {
     ExpressionTree call = (ExpressionTree) path.getLeaf();
+    DirectCallContext directContext =
+        getDirectCallContextForInference(path, state, calledFromDataflow);
     TreePath parentPath = path.getParentPath();
     Tree parent = parentPath.getLeaf();
     while (parent instanceof ParenthesizedTree) {
       parentPath = parentPath.getParentPath();
       parent = parentPath.getLeaf();
     }
-    if (call instanceof MethodInvocationTree
-        && parent instanceof MethodInvocationTree parentInvocation
-        && isCallNeedingInference(parentInvocation)) {
-      return getCallAndContextForInference(
-          parentPath, state.withPath(parentPath), calledFromDataflow);
+    if (parent instanceof ExpressionTree exprParent) {
+      if ((exprParent instanceof MethodInvocationTree || exprParent instanceof NewClassTree)
+          && isCallNeedingInference(exprParent)) {
+        return getCallAndContextForInference(
+            parentPath, state.withPath(parentPath), calledFromDataflow);
+      }
     }
-    DirectCallContext directContext =
-        getDirectCallContextForInference(path, state, calledFromDataflow);
     return new CallAndContext(
         call, directContext.typeFromAssignmentContext, directContext.assignedToLocal);
   }
 
-  /**
-   * Returns the context immediately surrounding a call, without traversing nested generic calls.
-   */
   private DirectCallContext getDirectCallContextForInference(
       TreePath path, VisitorState state, boolean calledFromDataflow) {
     ExpressionTree call = (ExpressionTree) path.getLeaf();
@@ -2725,7 +2747,8 @@ public final class GenericsChecks {
       return new DirectCallContext(
           targetTypeAndAssignmentKind.typeFromAssignmentContext(),
           targetTypeAndAssignmentKind.assignedToLocal());
-    } else if (parent instanceof ReturnTree) {
+    }
+    if (parent instanceof ReturnTree) {
       TreePath enclosingMethodOrLambda =
           NullabilityUtil.findEnclosingMethodOrLambdaOrInitializer(parentPath);
       if (enclosingMethodOrLambda != null
@@ -2735,51 +2758,108 @@ public final class GenericsChecks {
           return new DirectCallContext(methodSymbol.getReturnType(), false);
         }
       }
-    } else if (parent instanceof ExpressionTree exprParent) {
-      if (exprParent instanceof MethodInvocationTree parentInvocation) {
-        Type formalParamType =
-            getFormalParameterTypeForArgument(
-                parentInvocation,
-                castToNonNull(ASTHelpers.getType(parentInvocation.getMethodSelect()))
-                    .asMethodType(),
-                call);
-        if (formalParamType == null) {
-          ExpressionTree methodSelect =
-              ASTHelpers.stripParentheses(parentInvocation.getMethodSelect());
-          if (methodSelect instanceof MemberSelectTree mst) {
-            @SuppressWarnings("ReferenceEquality") // deliberate reference equality check
-            boolean callIsReceiver = ASTHelpers.stripParentheses(mst.getExpression()) == call;
-            if (callIsReceiver) {
-              formalParamType =
-                  getEnclosingTypeForCallExpression(
-                      ASTHelpers.getSymbol(parentInvocation),
-                      parentInvocation,
-                      parentPath,
-                      state.withPath(parentPath),
-                      calledFromDataflow);
-            } else {
-              throw new RuntimeException(
-                  "did not find invocation "
-                      + state.getSourceForNode(call)
-                      + " as receiver expression of "
-                      + state.getSourceForNode(parentInvocation));
-            }
+      return new DirectCallContext(null, false);
+    }
+    if (parent instanceof MethodInvocationTree parentInvocation) {
+      Type.MethodType parentMethodType =
+          getInvokedMethodTypeAtCall(
+              ASTHelpers.getSymbol(parentInvocation),
+              parentInvocation,
+              parentPath,
+              state.withPath(parentPath),
+              calledFromDataflow);
+      Type formalParamType =
+          getFormalParameterTypeForArgument(parentInvocation, parentMethodType, call);
+      if (formalParamType == null) {
+        ExpressionTree methodSelect =
+            ASTHelpers.stripParentheses(parentInvocation.getMethodSelect());
+        if (methodSelect instanceof MemberSelectTree mst) {
+          @SuppressWarnings("ReferenceEquality") // deliberate reference equality check
+          boolean callIsReceiver = ASTHelpers.stripParentheses(mst.getExpression()) == call;
+          if (callIsReceiver) {
+            formalParamType =
+                getEnclosingTypeForCallExpression(
+                    ASTHelpers.getSymbol(parentInvocation),
+                    parentInvocation,
+                    parentPath,
+                    state.withPath(parentPath),
+                    calledFromDataflow);
+          } else {
+            throw new RuntimeException(
+                "did not find invocation "
+                    + state.getSourceForNode(call)
+                    + " as receiver expression of "
+                    + state.getSourceForNode(parentInvocation));
           }
         }
-        return new DirectCallContext(formalParamType, false);
-      } else if (exprParent instanceof ConditionalExpressionTree) {
-        TreePath conditionalPath = getOutermostConditionalExpressionPath(parentPath);
-        TargetTypeAndAssignmentKind targetTypeAndAssignmentKind =
-            getTargetTypeForConditionalExpression(
-                (ConditionalExpressionTree) conditionalPath.getLeaf(),
-                state.withPath(conditionalPath),
-                calledFromDataflow);
-        return new DirectCallContext(
-            targetTypeAndAssignmentKind.typeFromAssignmentContext(),
-            targetTypeAndAssignmentKind.assignedToLocal());
       }
+      return new DirectCallContext(formalParamType, false);
+    }
+    if (parent instanceof ConditionalExpressionTree) {
+      TreePath conditionalPath = getOutermostConditionalExpressionPath(parentPath);
+      TargetTypeAndAssignmentKind targetTypeAndAssignmentKind =
+          getTargetTypeForConditionalExpression(
+              (ConditionalExpressionTree) conditionalPath.getLeaf(),
+              state.withPath(conditionalPath),
+              calledFromDataflow);
+      return new DirectCallContext(
+          targetTypeAndAssignmentKind.typeFromAssignmentContext(),
+          targetTypeAndAssignmentKind.assignedToLocal());
+    }
+    if (parent instanceof NewClassTree parentConstructorCall) {
+      Type parentClassType;
+      if (isCallNeedingInference(parentConstructorCall)) {
+        CallAndContext parentContext =
+            getCallAndContextForInference(parentPath, state, calledFromDataflow);
+        parentClassType =
+            inferCallType(
+                state,
+                parentConstructorCall,
+                parentPath,
+                parentContext.typeFromAssignmentContext,
+                parentContext.assignedToLocal,
+                calledFromDataflow);
+      } else {
+        parentClassType = getTreeType(parentConstructorCall, state.withPath(parentPath));
+      }
+      if (parentClassType != null) {
+        Symbol.MethodSymbol parentCtorSymbol = ASTHelpers.getSymbol(parentConstructorCall);
+        Type parentCtorType =
+            TypeSubstitutionUtils.memberType(
+                state.getTypes(), parentClassType, parentCtorSymbol, config);
+        return new DirectCallContext(
+            getFormalParameterTypeForArgument(
+                parentConstructorCall, parentCtorType.asMethodType(), call),
+            false);
+      }
+      return new DirectCallContext(null, false);
     }
     return new DirectCallContext(null, false);
+  }
+
+  private Type.MethodType getInvokedMethodTypeAtCall(
+      Symbol.MethodSymbol methodSymbol,
+      Tree tree,
+      @Nullable TreePath path,
+      VisitorState state,
+      boolean calledFromDataflow) {
+    Type invokedMethodType = methodSymbol.type;
+    Type enclosingType =
+        getEnclosingTypeForCallExpression(methodSymbol, tree, path, state, calledFromDataflow);
+    if (enclosingType != null) {
+      invokedMethodType =
+          TypeSubstitutionUtils.memberType(state.getTypes(), enclosingType, methodSymbol, config);
+    }
+    if (tree instanceof MethodInvocationTree
+        && invokedMethodType instanceof Type.ForAll forAllType) {
+      invokedMethodType =
+          substituteTypeArgsInGenericMethodType(tree, forAllType, path, state, calledFromDataflow);
+    }
+    return handler.onOverrideMethodType(
+        methodSymbol,
+        invokedMethodType.asMethodType(),
+        state,
+        tree instanceof MethodInvocationTree invocationTree ? invocationTree : null);
   }
 
   /**
@@ -3155,6 +3235,7 @@ public final class GenericsChecks {
     inferredPolyExpressionTypes.clear();
     inferredVarLocalTypes.clear();
     varLocalDeclarations.clear();
+    nestedNullabilityRepairInProgress.clear();
   }
 
   public boolean isNullableAnnotated(Type type) {
