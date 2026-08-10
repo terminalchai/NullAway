@@ -750,19 +750,29 @@ public final class GenericsChecks {
       return typeOrNullIfRaw(result);
     }
     if (tree instanceof NewClassTree newClassTree) {
-      if (TreeInfo.isDiamond((JCTree) newClassTree)) {
-        if (newClassTree.getClassBody() != null) {
-          // Keep existing behavior for diamond anonymous classes, which are not yet fully
-          // supported. Tracked in https://github.com/uber/NullAway/issues/1475
-          return null;
-        }
-        // For constructor calls using diamond operator, infer from assignment context.
-        // TODO handle diamond constructor calls passed to generic methods
-        // https://github.com/uber/NullAway/issues/1470
-        Type fromAssignmentContext =
-            getDiamondTypeFromContext(newClassTree, state, calledFromDataflow);
-        if (fromAssignmentContext != null) {
-          return fromAssignmentContext;
+      if (TreeInfo.isDiamond((JCTree) newClassTree) && newClassTree.getClassBody() != null) {
+        // Keep existing behavior for diamond anonymous classes, which are not yet fully supported.
+        // Tracked in https://github.com/uber/NullAway/issues/1475
+        return null;
+      }
+      if (hasInferredClassTypeArguments(newClassTree)) {
+        TreePath currentPath = state.getPath();
+        @SuppressWarnings("ReferenceEquality") // deliberate reference equality check
+        boolean currentPathLeafIsTree =
+            currentPath != null && ASTHelpers.stripParentheses(currentPath.getLeaf()) == tree;
+        if (currentPathLeafIsTree) {
+          DirectCallContext directContext =
+              getDirectCallContextForInference(currentPath, state, calledFromDataflow);
+          Type constructorAssignmentContext =
+              sanitizeAssignmentContextForDiamondConstructor(
+                  directContext.typeFromAssignmentContext);
+          return inferCallType(
+              state,
+              newClassTree,
+              currentPath,
+              constructorAssignmentContext,
+              directContext.assignedToLocal,
+              calledFromDataflow);
         }
       }
       if (newClassTree.getIdentifier() instanceof ParameterizedTypeTree paramTypedTree
@@ -872,27 +882,6 @@ public final class GenericsChecks {
   }
 
   /**
-   * Gets the type of a constructor call using a diamond operator from its assignment context, if
-   * available.
-   */
-  private @Nullable Type getDiamondTypeFromContext(
-      NewClassTree tree, VisitorState state, boolean calledFromDataflow) {
-    return getDiamondTypeFromParentContext(
-        tree, state, castToNonNull(state.getPath().getParentPath()), calledFromDataflow);
-  }
-
-  /**
-   * Computes the assignment-context type for an inferred constructor call, given a path to its
-   * parent context.
-   */
-  private @Nullable Type getDiamondTypeFromParentContext(
-      NewClassTree tree, VisitorState state, TreePath parentPath, boolean calledFromDataflow) {
-    return getTargetTypeFromParentContext(
-            tree, new TreePath(parentPath, tree), state, calledFromDataflow)
-        .typeFromAssignmentContext();
-  }
-
-  /**
    * Returns the inferred/declared formal parameter type corresponding to actual parameter {@code
    * argumentTree}.
    */
@@ -934,7 +923,8 @@ public final class GenericsChecks {
           && methodSymbol.type instanceof Type.ForAll
           && methodInvocation.getTypeArguments().isEmpty();
     }
-    return false;
+    return expressionTree instanceof NewClassTree newClassTree
+        && hasInferredClassTypeArguments(newClassTree);
   }
 
   /**
@@ -1353,6 +1343,16 @@ public final class GenericsChecks {
 
   private Symbol.MethodSymbol getMethodSymbolForCall(ExpressionTree callTree) {
     return (Symbol.MethodSymbol) castToNonNull(ASTHelpers.getSymbol(callTree));
+  }
+
+  /**
+   * A bare method type variable does not provide useful structure for inferring nullability of a
+   * diamond constructor's class type arguments. In such cases we let constructor inference rely on
+   * constructor arguments and any more structured surrounding context instead.
+   */
+  private @Nullable Type sanitizeAssignmentContextForDiamondConstructor(
+      @Nullable Type contextType) {
+    return contextType instanceof Type.TypeVar ? null : contextType;
   }
 
   /**
@@ -2227,17 +2227,6 @@ public final class GenericsChecks {
     }
     Type invokedMethodType = methodSymbol.type;
     Type enclosingType = null;
-    if (tree instanceof NewClassTree newClassTree) {
-      if (hasInferredClassTypeArguments(newClassTree)) {
-        TreePath currentPath = state.getPath();
-        if (currentPath != null && ASTHelpers.stripParentheses(currentPath.getLeaf()) == tree) {
-          TreePath parentPath = currentPath.getParentPath();
-          if (parentPath != null) {
-            enclosingType = getDiamondTypeFromParentContext(newClassTree, state, parentPath, false);
-          }
-        }
-      }
-    }
     if (enclosingType == null) {
       enclosingType = getEnclosingTypeForCallExpression(methodSymbol, tree, null, state, false);
     }
@@ -2676,6 +2665,9 @@ public final class GenericsChecks {
   private record CallAndContext(
       ExpressionTree call, @Nullable Type typeFromAssignmentContext, boolean assignedToLocal) {}
 
+  private record DirectCallContext(
+      @Nullable Type typeFromAssignmentContext, boolean assignedToLocal) {}
+
   /**
    * Given a {@link TreePath} to an invocation of a generic method, collect information about the
    * appropriate invocation on which to perform type inference, and the relevant information from
@@ -2703,11 +2695,34 @@ public final class GenericsChecks {
       parentPath = parentPath.getParentPath();
       parent = parentPath.getLeaf();
     }
+    if (call instanceof MethodInvocationTree
+        && parent instanceof MethodInvocationTree parentInvocation
+        && isCallNeedingInference(parentInvocation)) {
+      return getCallAndContextForInference(
+          parentPath, state.withPath(parentPath), calledFromDataflow);
+    }
+    DirectCallContext directContext =
+        getDirectCallContextForInference(path, state, calledFromDataflow);
+    return new CallAndContext(
+        call, directContext.typeFromAssignmentContext, directContext.assignedToLocal);
+  }
+
+  /**
+   * Returns the context immediately surrounding a call, without traversing nested generic calls.
+   */
+  private DirectCallContext getDirectCallContextForInference(
+      TreePath path, VisitorState state, boolean calledFromDataflow) {
+    ExpressionTree call = (ExpressionTree) path.getLeaf();
+    TreePath parentPath = path.getParentPath();
+    Tree parent = parentPath.getLeaf();
+    while (parent instanceof ParenthesizedTree) {
+      parentPath = parentPath.getParentPath();
+      parent = parentPath.getLeaf();
+    }
     if (parent instanceof AssignmentTree || parent instanceof VariableTree) {
       TargetTypeAndAssignmentKind targetTypeAndAssignmentKind =
           getTargetTypeForAssignmentContext(parent, state.withPath(parentPath), calledFromDataflow);
-      return new CallAndContext(
-          call,
+      return new DirectCallContext(
           targetTypeAndAssignmentKind.typeFromAssignmentContext(),
           targetTypeAndAssignmentKind.assignedToLocal());
     } else if (parent instanceof ReturnTree) {
@@ -2717,15 +2732,11 @@ public final class GenericsChecks {
           && enclosingMethodOrLambda.getLeaf() instanceof MethodTree enclosingMethod) {
         Symbol.MethodSymbol methodSymbol = ASTHelpers.getSymbol(enclosingMethod);
         if (methodSymbol != null) {
-          return new CallAndContext(call, methodSymbol.getReturnType(), false);
+          return new DirectCallContext(methodSymbol.getReturnType(), false);
         }
       }
     } else if (parent instanceof ExpressionTree exprParent) {
       if (exprParent instanceof MethodInvocationTree parentInvocation) {
-        if (isCallNeedingInference(parentInvocation)) {
-          return getCallAndContextForInference(
-              parentPath, state.withPath(parentPath), calledFromDataflow);
-        }
         Type formalParamType =
             getFormalParameterTypeForArgument(
                 parentInvocation,
@@ -2755,7 +2766,7 @@ public final class GenericsChecks {
             }
           }
         }
-        return new CallAndContext(call, formalParamType, false);
+        return new DirectCallContext(formalParamType, false);
       } else if (exprParent instanceof ConditionalExpressionTree) {
         TreePath conditionalPath = getOutermostConditionalExpressionPath(parentPath);
         TargetTypeAndAssignmentKind targetTypeAndAssignmentKind =
@@ -2763,13 +2774,12 @@ public final class GenericsChecks {
                 (ConditionalExpressionTree) conditionalPath.getLeaf(),
                 state.withPath(conditionalPath),
                 calledFromDataflow);
-        return new CallAndContext(
-            call,
+        return new DirectCallContext(
             targetTypeAndAssignmentKind.typeFromAssignmentContext(),
             targetTypeAndAssignmentKind.assignedToLocal());
       }
     }
-    return new CallAndContext(call, null, false);
+    return new DirectCallContext(null, false);
   }
 
   /**
